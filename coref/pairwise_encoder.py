@@ -43,25 +43,24 @@ class PairwiseEncoder(torch.nn.Module):
 
     def forward(
             self,  # type: ignore  # pylint: disable=arguments-differ  #35566 in pytorch
-            top_indices: torch.Tensor,
+            link_pairs: torch.Tensor,
             doc: Doc) -> torch.Tensor:
-        word_ids = torch.arange(0, len(doc["cased_words"]), device=self.device)
-        speaker_map = torch.tensor(self._speaker_map(doc), device=self.device)
+        pair_num = link_pairs.size(0)
+        speaker_map = torch.tensor(self._speaker_map(doc), device=self.device)[link_pairs]
 
-        same_speaker = (speaker_map[top_indices] == speaker_map.unsqueeze(1))
-        same_speaker = self.speaker_emb(same_speaker.to(torch.long))
+        same_speaker = (speaker_map[:,0] == speaker_map[:,1]).to(torch.long)
+        same_speaker = self.speaker_emb(same_speaker)
 
         # bucketing the distance (see __init__())
-        distance = (word_ids.unsqueeze(1) - word_ids[top_indices]).clamp_min_(min=1)
-        log_distance = distance.to(torch.float).log2().floor_()
-        log_distance = log_distance.clamp_max_(max=6).to(torch.long)
-        distance = torch.where(distance < 5, distance - 1, log_distance + 2)
+        distance = (link_pairs[0,1] - link_pairs[0,0]).to(self.device)
+        log_distance = distance.log2().floor_().clamp_max_(max=6).to(torch.long)
+        distance = torch.where(distance < 5, distance - 1, log_distance + 2).repeat(pair_num)
         distance = self.distance_emb(distance)
-
-        genre = torch.tensor(self.genre2int[doc["document_id"][:2]], device=self.device).expand_as(top_indices)
+        
+        genre = torch.tensor(self.genre2int[doc["document_id"][:2]], device=self.device).repeat(pair_num)
         genre = self.genre_emb(genre)
 
-        return self.dropout(torch.cat((same_speaker, distance, genre), dim=2))
+        return self.dropout(torch.cat((same_speaker, distance, genre), dim=1))
 
     @staticmethod
     def _speaker_map(doc: Doc) -> List[int]:

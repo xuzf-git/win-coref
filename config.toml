@@ -19,8 +19,8 @@ device = "cuda:0"
 # Bert settings ======================
 
 # Base bert model architecture and tokenizer
-# bert_model = "bert-large-cased"
-bert_model = "roberta-large"
+bert_model = "bert-large-cased"
+# bert_model = "roberta-large"
 
 # Controls max length of sequences passed through bert to obtain its
 # contextual embeddings
@@ -40,6 +40,7 @@ sp_embedding_size = 64
 # batch. Only affects final scoring; mention extraction and rough scoring
 # are less memory intensive, so they are always done in just one batch.
 a_scoring_batch_size = 512
+batch_size = 32
 
 # AnaphoricityScorer FFNN parameters
 hidden_size = 1024
@@ -58,6 +59,7 @@ max_span_len = 64
 # Controls how many pairs should be preserved per mention
 # after applying rough scoring.
 rough_k = 50
+top_k = 5
 
 
 # Training settings ==================

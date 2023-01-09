@@ -26,12 +26,14 @@ class Config:  # pylint: disable=too-many-instance-attributes, too-few-public-me
     embedding_size: int
     sp_embedding_size: int
     a_scoring_batch_size: int
+    batch_size: int
     hidden_size: int
     n_hidden_layers: int
 
     max_span_len: int
 
     rough_k: int
+    top_k: int
 
     bert_finetune: bool
     dropout_rate: float
