@@ -30,6 +30,46 @@ class WinDecoder(torch.nn.Module):
         self.device = config.device
         self.win_builder = WinBuilder(features, config)
 
+    def _beam_search(self, local_structs: torch.Tensor, local_scores: torch.Tensor, first_window_struct: torch.Tensor,
+                     first_window_scores: torch.Tensor):
+        """
+        BeamSearch the top-k global structure within the constraint of local_structs
+        Args:
+            local_structs: a tensor of shape [n_windows, 2k, windows_size + 1], the local structure
+            local_scores: a tensor of shape [n_windows, 2k], the local score
+            first_window_struct: a tensor of shape [k, windows_size + 1], the first window structure and dummmy
+            first_window_scores: a tensor of shape [k, windows_size + 1], the first window score
+        Returns:
+            global_struct: a tensor of shape [k, n_mentions + 1], the top-k global structure
+            global_scores: a tensor of shape [k, n_mentions + 1], the top-k global score
+        """
+        n_windows = local_structs.size(0)
+        windows_size = local_structs.size(2) - 1
+
+        global_struct_lst: List[torch.Tensor] = []
+        global_scores_lst: List[torch.Tensor] = []
+
+        # init the first window with previous windows size step's first window [2*k, windows_size + 1]
+        global_struct = torch.cat((first_window_struct, first_window_struct), dim=0)
+        global_scores = torch.cat((first_window_scores, first_window_scores), dim=0)
+
+        # init the first window by appending the new link  [2*k, windows_size + 2]
+        global_struct = torch.cat((global_struct, local_structs[0, :, -1].unsqueeze(1)), dim=1)
+        global_scores = torch.cat((global_scores, local_scores[0, :].reshape(-1, 1)), dim=1)
+
+        # select the top-k according to sum of global scores
+        global_score_sum = torch.sum(global_scores, dim=1)
+        global_score_sum, topk_indices = torch.topk(global_score_sum, self.topk, dim=0)
+        global_struct = global_struct[topk_indices, :]
+        global_scores = global_scores[topk_indices, :]
+
+        for i in range(1, n_windows):
+            # use the middle (rm start & end) sequence of last window as query struct
+            query_struct = global_struct[:, i + 1:i + 1 + windows_size]
+            pass
+
+        return global_struct, global_scores
+
     def forward(
             self,  # type: ignore  # pylint: disable=arguments-differ  #35566 in pytorch
             mentions: torch.Tensor,
@@ -54,7 +94,14 @@ class WinDecoder(torch.nn.Module):
             # build local_structure(d + 1) from global_structure(d)
             local_struct, local_scores = self.win_builder(mentions, doc, global_struct, global_scores, windows_size)
 
+            # get the first window's link and scores of the previous step to init
+            previous_windows_size = windows_size - 1
+            first_window_struct = global_struct[:, :previous_windows_size + 2]
+            first_window_scores = global_scores[:, :previous_windows_size + 2]
             # BeamSearch the top-k global structure
+
+            global_struct, global_scores = self._beam_search(local_struct, local_scores, first_window_struct,
+                                                             first_window_scores)
 
         return
 
@@ -117,7 +164,8 @@ class WinBuilder(torch.nn.Module):
             local_struct_batch = global_struct_batch.unfold(dimension=1, size=windows_size + 1, step=1)
             local_scores_batch = global_scores_batch[:, -real_batch_size:]  # [k, b_s]
             # new local structure: link the last mention of windows to the first mention, 0 means link to dummy
-            new_link = torch.arange(i, i + real_batch_size).to(self.device).view(1, -1, 1).repeat(local_struct_batch.size(0), 1, 1)
+            new_link = torch.arange(i, i + real_batch_size).to(self.device).view(1, -1, 1).repeat(
+                local_struct_batch.size(0), 1, 1)
             local_struct_batch_append = torch.cat((local_struct_batch[:, :, :windows_size], new_link), dim=2)
             # score the new local structure
             new_link_pairs = (torch.arange(i, i + real_batch_size).unsqueeze(1).to(self.device),
@@ -127,30 +175,12 @@ class WinBuilder(torch.nn.Module):
             features_batch = self._get_features(mentions[new_link_pairs], pairwise_features)
             new_link_pairs_scores = self.scorer(features_batch)
             local_scores_batch_append = new_link_pairs_scores.unsqueeze(0).repeat(local_scores_batch.size(0), 1)
-            
-            local_struct_lst.append(torch.cat((local_struct_batch, local_struct_batch_append), dim=0))
-            local_scores_lst.append(torch.cat((local_scores_batch, local_scores_batch_append), dim=0))
-        
-        local_struct = torch.cat(local_struct_lst, dim=1).view(n_windows, -1, windows_size + 1)  # [n_windows, 2k, windows_size + 1]
-        local_scores = torch.cat(local_scores_lst, dim=1).view(n_windows, -1)  # [n_windows, 2k]
+
+            local_struct_lst.append(torch.cat((local_struct_batch, local_struct_batch_append), dim=0).clone())
+            local_scores_lst.append(torch.cat((local_scores_batch, local_scores_batch_append), dim=0).clone())
+        # [n_windows, 2k, w_s + 1]
+        local_struct = torch.einsum('kwl->wkl', torch.cat(local_struct_lst, dim=1))
+        # [n_windows, 2k]
+        local_scores = torch.einsum('kw->wk', torch.cat(local_scores_lst, dim=1))
 
         return local_struct, local_scores
-
-
-def load_config(config_path: str, section: str) -> Config:
-    config = toml.load(config_path)
-    default_section = config["DEFAULT"]
-    current_section = config[section]
-    unknown_keys = (set(current_section.keys()) - set(default_section.keys()))
-    if unknown_keys:
-        raise ValueError(f"Unexpected config keys: {unknown_keys}")
-    return Config(section, **{**default_section, **current_section})
-
-
-if __name__ == '__main__':
-    config = load_config(config_path="config.toml", section="DEFAULT")
-
-    # model = WinDecoder(1024, 5)
-    # a = model(torch.randn(12, 1024))
-    model = WinBuilder(config)
-    a = model(torch.randint(low=0, high=10, size=(5, 15)), torch.randn(5, 15), 6)
