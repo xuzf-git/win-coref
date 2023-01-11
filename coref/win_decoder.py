@@ -46,9 +46,6 @@ class WinDecoder(torch.nn.Module):
         n_windows = local_structs.size(0)
         windows_size = local_structs.size(2) - 1
 
-        global_struct_lst: List[torch.Tensor] = []
-        global_scores_lst: List[torch.Tensor] = []
-
         # init the first window with previous windows size step's first window [2*k, windows_size + 1]
         global_struct = torch.cat((first_window_struct, first_window_struct), dim=0)
         global_scores = torch.cat((first_window_scores, first_window_scores), dim=0)
@@ -64,9 +61,32 @@ class WinDecoder(torch.nn.Module):
         global_scores = global_scores[topk_indices, :]
 
         for i in range(1, n_windows):
-            # use the middle (rm start & end) sequence of last window as query struct
-            query_struct = global_struct[:, i + 1:i + 1 + windows_size]
-            pass
+            # use the middle (rm start & end) sequence of last window as query struct [k, windows_size-1]
+            query_struct = global_struct[:, i + 1:i + windows_size]
+            # get the legal candidate for the current window
+            candidate_structs = local_structs[i, :, :]  # [2*k, windows_size + 1]
+            candidate_scores = local_scores[i, :]  # [2*k]
+            key_struct = candidate_structs[:, :-2]  # [2*k, windows_size - 1
+            condition = torch.all(torch.eq(
+                query_struct.unsqueeze(1).repeat(1, key_struct.size(0), 1),
+                key_struct.unsqueeze(0).repeat(query_struct.size(0), 1, 1)),
+                                  dim=2)
+            legal_candidate_link = candidate_structs[:, -1].unsqueeze(0).unsqueeze(2).repeat(condition.size(0), 1, 1)[condition]
+            legal_candidate_score = candidate_scores.unsqueeze(0).unsqueeze(2).repeat(condition.size(0), 1, 1)[condition]
+            
+            repeat_count = torch.sum(condition, dim=1)
+            global_struct = torch.repeat_interleave(global_struct, repeat_count, dim=0)
+            global_scores = torch.repeat_interleave(global_scores, repeat_count, dim=0)
+            global_score_sum = torch.repeat_interleave(global_score_sum, repeat_count, dim=0)
+
+            # append the legal candidate link to the global struct [k, windows_size + 2]
+            global_struct = torch.cat((global_struct, legal_candidate_link), dim=1)
+            global_scores = torch.cat((global_scores, legal_candidate_score), dim=1)
+            global_score_sum = global_score_sum + legal_candidate_score.squeeze(1)
+            
+            global_score_sum, topk_indices = torch.topk(global_score_sum, self.topk, dim=0)
+            global_struct = global_struct[topk_indices, :]
+            global_scores = global_scores[topk_indices, :]
 
         return global_struct, global_scores
 
