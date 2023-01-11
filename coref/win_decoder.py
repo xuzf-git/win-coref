@@ -2,18 +2,14 @@
     by windows-pruning HOI method.
 """
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import List, Tuple
 
 import torch
-import toml
 
 from coref.config import Config
 from coref.anaphoricity_scorer import AnaphoricityScorer
-from coref import utils
 from coref.const import Doc
 from coref.pairwise_encoder import PairwiseEncoder
-
-import argparse
 
 
 class WinDecoder(torch.nn.Module):
@@ -30,8 +26,7 @@ class WinDecoder(torch.nn.Module):
         self.device = config.device
         self.win_builder = WinBuilder(features, config)
 
-    def _beam_search(self, local_structs: torch.Tensor, local_scores: torch.Tensor, first_window_struct: torch.Tensor,
-                     first_window_scores: torch.Tensor):
+    def _beam_search(self, local_structs: torch.Tensor, local_scores: torch.Tensor, first_window_struct: torch.Tensor, first_window_scores: torch.Tensor):
         """
         BeamSearch the top-k global structure within the constraint of local_structs
         Args:
@@ -56,37 +51,37 @@ class WinDecoder(torch.nn.Module):
 
         # select the top-k according to sum of global scores
         global_score_sum = torch.sum(global_scores, dim=1)
-        global_score_sum, topk_indices = torch.topk(global_score_sum, self.topk, dim=0)
+        global_score_sum, topk_indices = torch.topk(global_score_sum, min(self.topk, global_score_sum.size(0)), dim=0, sorted=True)
         global_struct = global_struct[topk_indices, :]
         global_scores = global_scores[topk_indices, :]
 
+        # delete the repeat global struct
+        global_data = torch.unique(torch.cat((global_struct, global_scores, global_score_sum.unsqueeze(1)), dim=1), dim=0)
+        global_struct = global_data[:, :global_struct.size(1)]
+        global_scores = global_data[:, global_struct.size(1):global_struct.size(1) + global_scores.size(1)]
+        global_score_sum = global_data[:, -1]
+
         for i in range(1, n_windows):
-            # use the middle (rm start & end) sequence of last window as query struct [k, windows_size-1]
-            query_struct = global_struct[:, i + 1:i + windows_size]
-            # get the legal candidate for the current window
             candidate_structs = local_structs[i, :, :]  # [2*k, windows_size + 1]
             candidate_scores = local_scores[i, :]  # [2*k]
-            key_struct = candidate_structs[:, :-2]  # [2*k, windows_size - 1
-            condition = torch.all(torch.eq(
-                query_struct.unsqueeze(1).repeat(1, key_struct.size(0), 1),
-                key_struct.unsqueeze(0).repeat(query_struct.size(0), 1, 1)),
-                                  dim=2)
-            legal_candidate_link = candidate_structs[:, -1].unsqueeze(0).unsqueeze(2).repeat(condition.size(0), 1, 1)[condition]
-            legal_candidate_score = candidate_scores.unsqueeze(0).unsqueeze(2).repeat(condition.size(0), 1, 1)[condition]
-            
-            repeat_count = torch.sum(condition, dim=1)
-            global_struct = torch.repeat_interleave(global_struct, repeat_count, dim=0)
-            global_scores = torch.repeat_interleave(global_scores, repeat_count, dim=0)
-            global_score_sum = torch.repeat_interleave(global_score_sum, repeat_count, dim=0)
 
-            # append the legal candidate link to the global struct [k, windows_size + 2]
-            global_struct = torch.cat((global_struct, legal_candidate_link), dim=1)
-            global_scores = torch.cat((global_scores, legal_candidate_score), dim=1)
-            global_score_sum = global_score_sum + legal_candidate_score.squeeze(1)
-            
-            global_score_sum, topk_indices = torch.topk(global_score_sum, self.topk, dim=0)
+            # get all states for the current windos
+            gs0 = global_struct.size(0)
+            cs0 = candidate_structs.size(0)
+            global_struct = torch.cat((global_struct.repeat(cs0, 1), candidate_structs[:, -1].repeat(gs0).unsqueeze(1)), dim=1)
+            global_scores = torch.cat((global_scores.repeat(cs0, 1), candidate_scores.repeat(gs0).unsqueeze(1)), dim=1)
+            global_score_sum = global_score_sum.repeat(cs0) + candidate_scores.repeat(gs0)
+
+            # select the top-k according to sum of global scores
+            global_score_sum, topk_indices = torch.topk(global_score_sum, min(self.topk, global_score_sum.size(0)), dim=0, sorted=True)
             global_struct = global_struct[topk_indices, :]
             global_scores = global_scores[topk_indices, :]
+
+            # delete the repeat global struct
+            global_data = torch.unique(torch.cat((global_struct, global_scores, global_score_sum.unsqueeze(1)), dim=1), dim=0)
+            global_struct = global_data[:, :global_struct.size(1)]
+            global_scores = global_data[:, global_struct.size(1):global_struct.size(1) + global_scores.size(1)]
+            global_score_sum = global_data[:, -1]
 
         return global_struct, global_scores
 
@@ -108,8 +103,8 @@ class WinDecoder(torch.nn.Module):
 
         n_mentions = mentions.size(0)
         # generate the local structure and local score
-        global_struct = torch.zeros(self.topk, n_mentions + 1).to(self.device)
-        global_scores = torch.zeros(self.topk, n_mentions + 1).to(self.device)
+        global_struct = torch.zeros(1, n_mentions + 1).to(self.device)
+        global_scores = torch.zeros(1, n_mentions + 1).to(self.device)
         for windows_size in range(1, n_mentions):
             # build local_structure(d + 1) from global_structure(d)
             local_struct, local_scores = self.win_builder(mentions, doc, global_struct, global_scores, windows_size)
@@ -118,12 +113,11 @@ class WinDecoder(torch.nn.Module):
             previous_windows_size = windows_size - 1
             first_window_struct = global_struct[:, :previous_windows_size + 2]
             first_window_scores = global_scores[:, :previous_windows_size + 2]
-            # BeamSearch the top-k global structure
+            
+            # BeamSearch the top-k global structure and global score
+            global_struct, global_scores = self._beam_search(local_struct, local_scores, first_window_struct, first_window_scores)
 
-            global_struct, global_scores = self._beam_search(local_struct, local_scores, first_window_struct,
-                                                             first_window_scores)
-
-        return
+        return global_struct, global_scores
 
 
 class WinBuilder(torch.nn.Module):
@@ -158,8 +152,7 @@ class WinBuilder(torch.nn.Module):
         features = torch.cat((a_mentions, b_mentions, similarity, pair_features), dim=1)
         return features
 
-    def forward(self, mentions: torch.Tensor, doc: Doc, global_struct: torch.Tensor, global_scores: torch.Tensor,
-                windows_size: int) -> torch.Tensor:
+    def forward(self, mentions: torch.Tensor, doc: Doc, global_struct: torch.Tensor, global_scores: torch.Tensor, windows_size: int) -> torch.Tensor:
         """
         Args:
             mentions: a tensor of shape [n_mentions + 1, features], the embedding of mentions.
@@ -184,12 +177,10 @@ class WinBuilder(torch.nn.Module):
             local_struct_batch = global_struct_batch.unfold(dimension=1, size=windows_size + 1, step=1)
             local_scores_batch = global_scores_batch[:, -real_batch_size:]  # [k, b_s]
             # new local structure: link the last mention of windows to the first mention, 0 means link to dummy
-            new_link = torch.arange(i, i + real_batch_size).to(self.device).view(1, -1, 1).repeat(
-                local_struct_batch.size(0), 1, 1)
+            new_link = torch.arange(i, i + real_batch_size).to(self.device).view(1, -1, 1).repeat(local_struct_batch.size(0), 1, 1)
             local_struct_batch_append = torch.cat((local_struct_batch[:, :, :windows_size], new_link), dim=2)
             # score the new local structure
-            new_link_pairs = (torch.arange(i, i + real_batch_size).unsqueeze(1).to(self.device),
-                              torch.arange(i, i + real_batch_size).unsqueeze(1).to(self.device) + windows_size)
+            new_link_pairs = (torch.arange(i, i + real_batch_size).unsqueeze(1).to(self.device), torch.arange(i, i + real_batch_size).unsqueeze(1).to(self.device) + windows_size)
             new_link_pairs = torch.cat(new_link_pairs, dim=1) - 1
             pairwise_features = self.pairwise_encoder(new_link_pairs, doc)
             features_batch = self._get_features(mentions[new_link_pairs], pairwise_features)
